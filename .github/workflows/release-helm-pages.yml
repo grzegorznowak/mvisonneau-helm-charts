@@ -1,0 +1,91 @@
+name: Release Helm Chart (Pages)
+
+on:
+  push:
+    tags:
+      - gitlab-ci-pipelines-exporter-*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-helm-pages
+  cancel-in-progress: true
+
+jobs:
+  pages:
+    runs-on: ubuntu-latest
+    env:
+      CHART_DIR: charts/gitlab-ci-pipelines-exporter
+      PUBLISH_DIR: dist
+      BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - name: Validate Chart version matches tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHART_VERSION=$(grep -E '^version:' "$CHART_DIR/Chart.yaml" | awk '{print $2}')
+          CHART_NAME=$(grep -E '^name:' "$CHART_DIR/Chart.yaml" | awk '{print $2}')
+          # If running on a tag, enforce tag-version match; otherwise use Chart.yaml version
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#gitlab-ci-pipelines-exporter-}"
+            if [ "$CHART_VERSION" != "$VERSION" ]; then
+              echo "Chart.yaml version ($CHART_VERSION) does not match tag ($VERSION)" >&2
+              exit 1
+            fi
+          else
+            VERSION="$CHART_VERSION"
+          fi
+          echo "name=$CHART_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update dependencies (Bitnami Redis via OCI)
+        env:
+          HELM_EXPERIMENTAL_OCI: "1"
+        run: helm dependency update "$CHART_DIR"
+
+      - name: Package chart
+        run: |
+          mkdir -p "$PUBLISH_DIR"
+          helm package "$CHART_DIR" -d "$PUBLISH_DIR"
+
+      - name: Prepare existing gh-pages and merge index
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fetch existing gh-pages branch if present
+          git fetch origin gh-pages:gh-pages || true
+          mkdir -p gh-pages
+          git -C gh-pages init
+          git -C gh-pages checkout gh-pages || true
+          # If an existing index.yaml is present, use it as merge base
+          if [ -f gh-pages/index.yaml ]; then
+            cp gh-pages/index.yaml "$PUBLISH_DIR/.old-index.yaml"
+          fi
+          # Build/merge index.yaml with proper URL
+          if [ -f "$PUBLISH_DIR/.old-index.yaml" ]; then
+            helm repo index "$PUBLISH_DIR" --url "$BASE_URL" --merge "$PUBLISH_DIR/.old-index.yaml"
+          else
+            helm repo index "$PUBLISH_DIR" --url "$BASE_URL"
+          fi
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: dist
+          publish_branch: gh-pages
+          keep_files: true
